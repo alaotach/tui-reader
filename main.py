@@ -13,6 +13,7 @@ from textual.screen import Screen
 import json
 import os
 from datetime import datetime
+from pdfminer.high_level import extract_text
 
 bm_tolerance = 2
 
@@ -61,6 +62,29 @@ def load_text(file_path):
 def wrap_text(text, width=70):
     return textwrap.wrap(text, width=width, replace_whitespace=False, drop_whitespace=False)
 
+def extract_text_from_pdf(file_path):
+    text = extract_text(file_path)
+    if not text:
+        return []
+    pages = text.split("\x0c")
+    paras = []
+    for i, t in enumerate(pages, start=1):
+        if t.strip():
+            paras.append(f"--- Page {i} ---")
+            lines = t.splitlines()
+            buffer = []
+            for line in lines:
+                stripped = line.strip()
+                if stripped:
+                    buffer.append(stripped)
+                else:
+                    if buffer:
+                        paras.append(" ".join(buffer))
+                        buffer = []
+            if buffer:
+                paras.append(" ".join(buffer))
+    return paras
+
 class Reader:
     def __init__(self, lines, scroll=0):
         self.lines = lines
@@ -107,7 +131,12 @@ class ReaderApp(App):
     def compose(self):
         yield ReadingView(id="reader-view")
     def on_mount(self):
-        paras = load_text(self.file_path)
+        if self.file_path.endswith(".pdf"):
+            paras = extract_text_from_pdf(self.file_path)
+            if not paras:
+                paras = ["[Error extracting text from PDF]"]
+        else:
+            paras = load_text(self.file_path)
         wlines = []
         for para in paras:
             wlines.extend(wrap_text(para, width=max_width))
@@ -161,14 +190,24 @@ class ReaderApp(App):
     def action_bookmark(self):
         data = load_state(self.file_path)
         bookmarks = data.get("bookmarks", [])
-        preview = self.reader.lines[self.reader.scroll][:50]
+        
+        if self.file_path.endswith(".pdf"):
+            page_num = 1
+            for i in range(self.reader.scroll, -1, -1):
+                line = self.reader.lines[i]
+                if line.startswith("--- Page ") and line.endswith(" ---"):
+                    page_num = int(line.split("Page ")[1].split(" ---")[0])
+                    break
+            preview = f"Page {page_num}"
+        else:
+            preview = self.reader.lines[self.reader.scroll][:50]
 
         for bm in bookmarks:
             if abs(bm["scroll"] - self.reader.scroll) <= bm_tolerance:
-                bm["scroll"] = current_scroll
+                bm["scroll"] = self.reader.scroll
                 bm["preview"] = preview
                 data["bookmarks"] = bookmarks
-                data["scroll"] = current_scroll
+                data["scroll"] = self.reader.scroll
                 data["timestamp"] = datetime.now().isoformat()
                 save_state(self.file_path, data)
                 return
