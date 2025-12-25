@@ -14,6 +14,8 @@ import json
 import os
 from datetime import datetime
 
+bm_tolerance = 2
+
 state_dir = os.path.join(os.path.expanduser("~"), ".reader_app")
 if not os.path.exists(state_dir):
     os.makedirs(state_dir)
@@ -22,22 +24,23 @@ if not os.path.exists(state_file):
     with open(state_file, 'w') as f:
         json.dump({}, f)
 
-def save_state(file_path, scroll):
+def save_state(file_path, data):
     with open(state_file, 'r') as f:
         state = json.load(f)
-    state[file_path] = {
-        "scroll": scroll,
-        "timestamp": datetime.now().isoformat()
-    }
+    if isinstance(data, int):
+        existing = state.get(file_path, {})
+        existing["scroll"] = data
+        existing["timestamp"] = datetime.now().isoformat()
+        state[file_path] = existing
+    else:
+        state[file_path] = data
     with open(state_file, 'w') as f:
-        json.dump(state, f)
+        json.dump(state, f, indent=2)
 
 def load_state(file_path):
     with open(state_file, 'r') as f:
         state = json.load(f)
-    if file_path in state:
-        return state[file_path]["scroll"]
-    return 0
+    return state.get(file_path, {})
 
 def parse_toc(lines):
     toc = []
@@ -77,7 +80,7 @@ class ReadingView(Static):
 class ResumeDecision(Message):
     def __init__(self, resume: bool, scroll: int):
         self.resume = resume
-        self.scroll = scroll
+        self.scroll = scroll['scroll'] if isinstance(scroll, dict) else scroll
         super().__init__()
 
 class ReaderApp(App):
@@ -93,13 +96,15 @@ class ReaderApp(App):
         ("k", "scroll_up", "Scroll Up"),
         ("q", "quit", "Quit"),
         ("t", "toc", "Table of Contents"),
+        ("b", "bookmark", "Bookmark"),
+        ("m", "show_bookmarks", "View Bookmarks"),
     ]
     def __init__(self, file_path: str):
         super().__init__()
         self.file_path = file_path
         self.reader: Reader = None
         self.view: ReadingView = None
-    def compose(self) -> ComposeResult:
+    def compose(self):
         yield ReadingView(id="reader-view")
     def on_mount(self):
         paras = load_text(self.file_path)
@@ -111,7 +116,8 @@ class ReaderApp(App):
         self.reader = Reader(wlines, scroll=0)
         self.view = self.query_one(ReadingView)
         
-        saved_scroll = load_state(self.file_path)
+        saved_state = load_state(self.file_path)
+        saved_scroll = saved_state.get("scroll", 0)
         if saved_scroll > 0:
             prompt = ResumePrompt(self.file_path, saved_scroll, len(wlines))
             self.push_screen(prompt, callback=self._handle_resume_choice)
@@ -120,7 +126,8 @@ class ReaderApp(App):
 
     def _handle_resume_choice(self, resume: bool | None):
         if resume:
-            self.reader.scroll = load_state(self.file_path)
+            saved_state = load_state(self.file_path)
+            self.reader.scroll = saved_state.get("scroll", 0)
         else:
             self.reader.scroll = 0
         self.update_view()
@@ -148,6 +155,38 @@ class ReaderApp(App):
 
         self.push_screen(
             TocScreen(toc),
+            callback=self._handle_toc_jump
+        )
+
+    def action_bookmark(self):
+        data = load_state(self.file_path)
+        bookmarks = data.get("bookmarks", [])
+        preview = self.reader.lines[self.reader.scroll][:50]
+
+        for bm in bookmarks:
+            if abs(bm["scroll"] - self.reader.scroll) <= bm_tolerance:
+                bm["scroll"] = current_scroll
+                bm["preview"] = preview
+                data["bookmarks"] = bookmarks
+                data["scroll"] = current_scroll
+                data["timestamp"] = datetime.now().isoformat()
+                save_state(self.file_path, data)
+                return
+        bookmarks.append({
+            "scroll": self.reader.scroll,
+            "preview": preview,
+        })
+        data["bookmarks"] = bookmarks
+        data["scroll"] = self.reader.scroll
+        data["timestamp"] = datetime.now().isoformat()
+        save_state(self.file_path, data)
+    def action_show_bookmarks(self):
+        data = load_state(self.file_path)
+        bookmarks = data.get("bookmarks", [])
+        if not bookmarks:
+            return
+        self.push_screen(
+            BookmarkScreen(bookmarks, self.file_path),
             callback=self._handle_toc_jump
         )
 
@@ -191,10 +230,10 @@ class ResumePrompt(Screen):
     def __init__(self, file_path: str, scroll: int, total_lines: int):
         super().__init__()
         self.file_path = file_path
-        self.scroll = scroll
+        self.scroll = scroll['scroll'] if isinstance(scroll, dict) else scroll
         self.total_lines = total_lines
         self.file_name = os.path.basename(file_path)
-        self.progress = int((scroll / max(total_lines - 1, 1)) * 100)
+        self.progress = int((scroll['scroll'] if isinstance(scroll, dict) else scroll / max(total_lines - 1, 1)) * 100)
 
     def compose(self):
         yield Vertical(
@@ -205,7 +244,7 @@ class ResumePrompt(Screen):
             id="box",
         )
 
-    def on_key(self, event: textual.events.Key) -> None:
+    def on_key(self, event: textual.events.Key):
         if event.key.lower() == "r":
             self.dismiss(True)
         elif event.key.lower() == "s":
@@ -226,6 +265,9 @@ class TocScreen(Screen):
         border: round white;
         overflow: auto;
     }
+    .selected {
+        background: #444444;
+    }
     """
     def __init__(self, toc):
         super().__init__()
@@ -242,16 +284,105 @@ class TocScreen(Screen):
                 )
     def on_key(self, event: Key):
         if event.key == "up":
+            old_index = self.index
             self.index = max(0, self.index - 1)
-            self.refresh()
+            if old_index != self.index:
+                self._update_selection()
         elif event.key == "down":
+            old_index = self.index
             self.index = min(len(self.toc) - 1, self.index + 1)
-            self.refresh()
+            if old_index != self.index:
+                self._update_selection()
         elif event.key == "enter":
             self.dismiss(self.toc[self.index][0])
         elif event.key.lower() == "q":
             self.dismiss(None)
     
+    def _update_selection(self):
+        statics = self.query(Static)
+        for i, static in enumerate(list(statics)[1:]):
+            if i == self.index:
+                static.add_class("selected")
+            else:
+                static.remove_class("selected")
+    
+class BookmarkScreen(Screen):
+    CSS = """
+    BookmarkScreen {
+        background: black;
+        align: center middle;
+    }
+    #box {
+        width: 60;
+        height: 80%;
+        padding: 1 2;
+        border: round white;
+        overflow: auto;
+    }
+    .selected {
+        background: #444444;
+    }
+    """
+    def __init__(self, bookmarks, file_path):
+        super().__init__()
+        self.bookmarks = bookmarks
+        self.file_path = file_path
+        self.index = 0
+    def compose(self):
+        with Vertical(id="box"):
+            yield Static("Bookmarks\n")
+            for i, bm in enumerate(self.bookmarks):
+                yield Static(
+                    f"{i+1}. {bm['preview']}",
+                    classes="selected" if i == self.index else ""
+                )
+    def on_key(self, event: Key):
+        if event.key == "up":
+            old_index = self.index
+            self.index = max(0, self.index - 1)
+            if old_index != self.index:
+                self._update_selection()
+        elif event.key == "down":
+            old_index = self.index
+            self.index = min(len(self.bookmarks) - 1, self.index + 1)
+            if old_index != self.index:
+                self._update_selection()
+        elif event.key == "enter":
+            self.dismiss(self.bookmarks[self.index]["scroll"])
+        elif event.key == "delete":
+            if len(self.bookmarks) > 0:
+                del self.bookmarks[self.index]
+                data = load_state(self.file_path)
+                data["bookmarks"] = self.bookmarks
+                save_state(self.file_path, data)
+                if len(self.bookmarks) == 0:
+                    self.dismiss(None)
+                else:
+                    if self.index >= len(self.bookmarks):
+                        self.index = len(self.bookmarks) - 1
+                    self._rebuild_list()
+        elif event.key.lower() == "q":
+            self.dismiss(None)
+    
+    def _update_selection(self):
+        statics = self.query(Static)
+        for i, static in enumerate(list(statics)[1:]):
+            if i == self.index:
+                static.add_class("selected")
+            else:
+                static.remove_class("selected")
+    
+    def _rebuild_list(self):
+        container = self.query_one("#box")
+        statics = list(container.query(Static))
+        for static in statics[1:]:
+            static.remove()
+        for i, bm in enumerate(self.bookmarks):
+            new_static = Static(
+                f"{i+1}. {bm['preview']}",
+                classes="selected" if i == self.index else ""
+            )
+            container.mount(new_static)
 
 if __name__ == "__main__":
     if len(sys.argv) != 2:
