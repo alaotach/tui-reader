@@ -4,6 +4,34 @@ import textual
 from textual.app import App, ComposeResult
 from textual.containers import Container
 from textual.widgets import Static
+import json
+import os
+from datetime import datetime
+
+state_dir = os.path.join(os.path.expanduser("~"), ".reader_app")
+if not os.path.exists(state_dir):
+    os.makedirs(state_dir)
+state_file = os.path.join(state_dir, "state.json")
+if not os.path.exists(state_file):
+    with open(state_file, 'w') as f:
+        json.dump({}, f)
+
+def save_state(file_path, scroll):
+    with open(state_file, 'r') as f:
+        state = json.load(f)
+    state[file_path] = {
+        "scroll": scroll,
+        "timestamp": datetime.now().isoformat()
+    }
+    with open(state_file, 'w') as f:
+        json.dump(state, f)
+
+def load_state(file_path):
+    with open(state_file, 'r') as f:
+        state = json.load(f)
+    if file_path in state:
+        return state[file_path]["scroll"]
+    return 0
 
 def load_text(file_path):
     with open(file_path, 'r', encoding='utf-8') as f:
@@ -14,9 +42,9 @@ def wrap_text(text, width=70):
     return textwrap.wrap(text, width=width, replace_whitespace=False, drop_whitespace=False)
 
 class Reader:
-    def __init__(self, lines):
+    def __init__(self, lines, scroll=0):
         self.lines = lines
-        self.scroll = 0
+        self.scroll = scroll
     def scroll_down(self, n=1):
         self.scroll = min(self.scroll + n, len(self.lines) - 1)
     def scroll_up(self, n=1):
@@ -55,7 +83,7 @@ class ReaderApp(App):
         for para in paras:
             wlines.extend(wrap_text(para, width=max_width))
             wlines.append("")
-        self.reader = Reader(wlines)
+        self.reader = Reader(wlines, scroll=load_state(self.file_path))
         self.view = self.query_one(ReadingView)
         self.update_view()
     def update_view(self):
@@ -72,6 +100,10 @@ class ReaderApp(App):
         if self.reader:
             self.reader.scroll_up()
             self.update_view()
+    def action_quit(self):
+        if self.reader:
+            save_state(self.file_path, self.reader.scroll)
+        self.exit()
 
 if __name__ == "__main__":
     if len(sys.argv) != 2:
