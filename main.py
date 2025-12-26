@@ -85,6 +85,21 @@ def extract_text_from_pdf(file_path):
                 paras.append(" ".join(buffer))
     return paras
 
+def extract_pdf_pages(lines):
+    pages = []
+    for i, line in enumerate(lines):
+        if line.startswith("--- Page ") and line.endswith(" ---"):
+            try:
+                page_num = int(line.split("Page ")[1].split(" ---")[0])
+                pages.append({
+                    "page": page_num,
+                    "scroll": i
+                })
+            except ValueError:
+                pass
+    return pages
+
+
 class Reader:
     def __init__(self, lines, scroll=0):
         self.lines = lines
@@ -122,6 +137,7 @@ class ReaderApp(App):
         ("t", "toc", "Table of Contents"),
         ("b", "bookmark", "Bookmark"),
         ("m", "show_bookmarks", "View Bookmarks"),
+        ("p", "pages", "PDF Pages"),
     ]
     def __init__(self, file_path: str):
         super().__init__()
@@ -229,6 +245,18 @@ class ReaderApp(App):
             callback=self._handle_toc_jump
         )
 
+    def action_pages(self):
+        if not self.file_path.endswith(".pdf"):
+            return
+        pages = extract_pdf_pages(self.reader.lines)
+        if not pages:
+            return
+        self.push_screen(
+            PdfPageScreen(pages),
+            callback=self._handle_toc_jump
+        )
+
+
     def action_quit(self):
         if self.reader:
             save_state(self.file_path, self.reader.scroll)
@@ -251,6 +279,95 @@ class ReaderApp(App):
         if line is not None:
             self.reader.scroll = line
             self.update_view()
+
+class PdfPageScreen(Screen):
+    CSS = """
+    PdfPageScreen {
+        background: black;
+        align: center middle;
+    }
+    #box {
+        width: 60;
+        height: 80%;
+        padding: 1 2;
+        border: round white;
+        overflow: auto;
+    }
+    .selected {
+        background: #444444;
+    }
+    """
+    def __init__(self, pages):
+        super().__init__()
+        self.pages = pages
+        self.index = 0
+        self.input_mode = False
+        self.buffer = ""
+    
+    def compose(self):
+        with Vertical(id="box"):
+            yield Static("Pages (Type page number and press Enter to jump)\n")
+            for i, item in enumerate(self.pages):
+                yield Static(
+                    f"Page {item['page']}",
+                    classes="selected" if i == self.index else ""
+                )
+    def on_key(self, event: Key):
+        if self.input_mode:
+            if event.key == "enter":
+                if self.buffer:
+                    try:
+                        page_num = int(self.buffer)
+                        for p in self.pages:
+                            if p["page"] == page_num:
+                                self.dismiss(p["scroll"])
+                                return
+                    except ValueError:
+                        pass
+                self._exit_input_mode()
+                
+            elif event.key == "escape":
+                self._exit_input_mode()
+                
+            elif event.key == "backspace":
+                self.buffer = self.buffer[:-1]
+                if self.buffer:
+                    title = self.query_one(Static)
+                    title.update(f"Pages - Enter page: {self.buffer}")
+                else:
+                    self._exit_input_mode()
+            elif len(event.key) == 1 and event.key in "0123456789":
+                self.buffer += event.key
+                title = self.query_one(Static)
+                title.update(f"Pages - Enter page: {self.buffer}")
+            return
+        if len(event.key) == 1 and event.key in "0123456789":
+            self.input_mode = True
+            self.buffer = event.key
+            title = self.query_one(Static)
+            title.update(f"Pages - Enter page: {self.buffer}")
+        elif event.key == "up":
+            self.index = max(0, self.index - 1)
+            self._update_selection()
+        elif event.key == "down":
+            self.index = min(len(self.pages) - 1, self.index + 1)
+            self._update_selection()
+        elif event.key == "enter":
+            self.dismiss(self.pages[self.index]["scroll"])
+        elif event.key.lower() == "q":
+            self.dismiss(None)
+    def _update_selection(self):
+        statics = self.query(Static)
+        for i, static in enumerate(list(statics)[1:]):
+            if i == self.index:
+                static.add_class("selected")
+            else:
+                static.remove_class("selected")
+    def _exit_input_mode(self):
+        self.input_mode = False
+        self.buffer = ""
+        title = self.query_one(Static)
+        title.update("Pages (Type page number and press Enter to jump)\n")
 
 class ResumePrompt(Screen):
     CSS = """
@@ -410,7 +527,7 @@ class BookmarkScreen(Screen):
                 static.add_class("selected")
             else:
                 static.remove_class("selected")
-    
+
     def _rebuild_list(self):
         container = self.query_one("#box")
         statics = list(container.query(Static))
