@@ -15,6 +15,24 @@ import os
 from datetime import datetime
 from pdfminer.high_level import extract_text
 
+THEMES = {
+    "dark": {
+        "name" : "dark",
+        "background": "black",
+        "text": "#d0d0d0",
+    },
+    "paper": {
+        "name" : "paper",
+        "background": "#fdf6e3",
+        "text": "#3a3a3a",
+    },
+    "sepia": {
+        "name" : "sepia",
+        "background": "#f4ecd8",
+        "text": "#5b4636",
+    }
+}
+
 bm_tolerance = 2
 
 state_dir = os.path.join(os.path.expanduser("~"), ".reader_app")
@@ -24,6 +42,29 @@ state_file = os.path.join(state_dir, "state.json")
 if not os.path.exists(state_file):
     with open(state_file, 'w') as f:
         json.dump({}, f)
+
+def load_theme():
+    with open(state_file, "r") as f:
+        state = json.load(f)
+
+    theme_state = state.get("_theme", {})
+    theme_name = theme_state.get("theme", "dark")
+
+    return THEMES.get(theme_name, THEMES["dark"])
+
+
+def save_theme(theme_name):
+    with open(state_file, "r") as f:
+        state = json.load(f)
+
+    if "_theme" not in state:
+        state["_theme"] = {}
+
+    state["_theme"]["theme"] = theme_name
+
+    with open(state_file, "w") as f:
+        json.dump(state, f, indent=2)
+
 
 def save_state(file_path, data):
     with open(state_file, 'r') as f:
@@ -125,8 +166,6 @@ class ResumeDecision(Message):
 class ReaderApp(App):
     CSS = """
     ReaderApp {
-        background: black;
-        color: white;
         padding: 1;
         }
     """
@@ -138,6 +177,9 @@ class ReaderApp(App):
         ("b", "bookmark", "Bookmark"),
         ("m", "show_bookmarks", "View Bookmarks"),
         ("p", "pages", "PDF Pages"),
+        ("T", "toggle_theme", "Toggle Theme"),
+        ("ctrl+t", "theme_selector", "Select Theme"),
+        ("ctrl+c", "quit", "Quit"),
     ]
     def __init__(self, file_path: str):
         super().__init__()
@@ -146,7 +188,20 @@ class ReaderApp(App):
         self.view: ReadingView = None
     def compose(self):
         yield ReadingView(id="reader-view")
+    def apply_theme(self):
+        theme = getattr(self, "_current_theme", None)
+        if theme:
+            self.styles.background = theme["background"]
+            self.styles.color = theme["text"]
+            if self.view:
+                self.view.styles.background = theme["background"]
+                self.view.styles.color = theme["text"]
+
     def on_mount(self):
+        self._current_theme = load_theme()
+        self.view = self.query_one(ReadingView)
+        self.apply_theme()
+        
         if self.file_path.endswith(".pdf"):
             paras = extract_text_from_pdf(self.file_path)
             if not paras:
@@ -159,7 +214,6 @@ class ReaderApp(App):
             wlines.append("")
         
         self.reader = Reader(wlines, scroll=0)
-        self.view = self.query_one(ReadingView)
         
         saved_state = load_state(self.file_path)
         saved_scroll = saved_state.get("scroll", 0)
@@ -255,7 +309,25 @@ class ReaderApp(App):
             PdfPageScreen(pages),
             callback=self._handle_toc_jump
         )
-
+    
+    def action_toggle_theme(self):
+        current_name = self._current_theme["name"]
+        theme_names = list(THEMES.keys())
+        next_index = (theme_names.index(current_name) + 1) % len(theme_names)
+        next_theme_name = theme_names[next_index]
+        self._current_theme = THEMES[next_theme_name]
+        save_theme(next_theme_name)
+        self.apply_theme()
+    def action_theme_selector(self):
+        self.push_screen(
+            ThemeSelector(),
+            callback=self._handle_theme_selection
+        )
+    def _handle_theme_selection(self, theme_name: str | None):
+        if theme_name:
+            self._current_theme = THEMES[theme_name]
+            save_theme(theme_name)
+            self.apply_theme()
 
     def action_quit(self):
         if self.reader:
@@ -279,6 +351,59 @@ class ReaderApp(App):
         if line is not None:
             self.reader.scroll = line
             self.update_view()
+
+
+class ThemeSelector(Screen):
+    CSS = """
+    ThemeSelector {
+        background: black;
+        align: center middle;
+    }
+    #box {
+        width: 40;
+        padding: 1 2;
+        border: round white;
+    }
+    .selected {
+        background: #444444;
+    }
+    """
+    def __init__(self):
+        super().__init__()
+        self.selected_index = 0
+    
+    def compose(self):
+        with Vertical(id="box"):
+            yield Static("Select Theme\n")
+            for i, theme_name in enumerate(THEMES.keys()):
+                yield Static(
+                    theme_name.capitalize(),
+                    classes="selected" if i == self.selected_index else ""
+                )
+    def on_key(self, event: Key):
+        if event.key == "up":
+            old_index = self.selected_index
+            self.selected_index = max(0, self.selected_index - 1)
+            if old_index != self.selected_index:
+                self._update_selection()
+        elif event.key == "down":
+            old_index = self.selected_index
+            self.selected_index = min(len(THEMES) - 1, self.selected_index + 1)
+            if old_index != self.selected_index:
+                self._update_selection()
+        elif event.key == "enter":
+            theme_name = list(THEMES.keys())[self.selected_index]
+            self.dismiss(theme_name)
+        elif event.key.lower() == "q":
+            self.dismiss(None)
+    
+    def _update_selection(self):
+        statics = self.query(Static)
+        for i, static in enumerate(list(statics)[1:]):
+            if i == self.selected_index:
+                static.add_class("selected")
+            else:
+                static.remove_class("selected")
 
 class PdfPageScreen(Screen):
     CSS = """
