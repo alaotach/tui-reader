@@ -39,6 +39,13 @@ THEMES = {
 bm_tolerance = 2
 
 state_dir = os.path.join(os.path.expanduser("~"), ".reader_app")
+cache_dir = os.path.join(state_dir, "cache")
+os.makedirs(cache_dir, exist_ok=True)
+
+def cache_path(file_path):
+    safe = (os.path.abspath(file_path).replace("\\", "_").replace("/", "_").replace(":", ""))
+    return os.path.join(cache_dir, safe + ".json")
+
 if not os.path.exists(state_dir):
     os.makedirs(state_dir)
 state_file = os.path.join(state_dir, "state.json")
@@ -65,21 +72,7 @@ def build_library():
         if not os.path.exists(path):
             continue
         scroll = data.get("scroll", 0)
-        total = data.get("total_lines", None)
-        if total is None:
-            try:
-                if path.endswith(".pdf"):
-                    paras = extract_text_from_pdf(path)
-                else:
-                    paras = load_text(path)
-                wlines = []
-                for para in paras:
-                    wlines.extend(wrap_text(para, width=max_width))
-                    wlines.append("")
-                total = len(wlines)
-                data["total_lines"] = total
-            except:
-                total = 1
+        total = data.get("total_lines", 1)
         
         progress = min(100, int((scroll / max(total - 1, 1)) * 100))
         library.append({
@@ -90,8 +83,6 @@ def build_library():
             "timestamp": data.get("timestamp", "")
         })
     library.sort(key=lambda x: x["timestamp"], reverse=True)
-    with open(state_file, "w") as f:
-        json.dump(state, f, indent=2)
     
     return library
 
@@ -154,6 +145,30 @@ def load_text(file_path):
     return [p.strip() for p in paras if p.strip()]
 def wrap_text(text, width=70):
     return textwrap.wrap(text, width=width, replace_whitespace=False, drop_whitespace=False)
+
+def load_or_parse(file_path):
+    cpath = cache_path(file_path)
+    mtime = os.path.getmtime(file_path)
+
+    if os.path.exists(cpath):
+        with open(cpath, "r", encoding="utf-8") as f:
+            cached = json.load(f)
+        if cached.get("mtime") == mtime:
+            return cached["lines"]
+    if file_path.endswith(".pdf"):
+        paras = extract_text_from_pdf(file_path)
+    else:
+        paras = load_text(file_path)
+
+    lines = []
+    for p in paras:
+        lines.extend(wrap_text(p, width=max_width))
+        lines.append("")
+
+    with open(cpath, "w", encoding="utf-8") as f:
+        json.dump({"mtime": mtime, "lines": lines}, f)
+
+    return lines
 
 def extract_text_from_pdf(file_path):
     text = extract_text(file_path)
@@ -257,49 +272,38 @@ class ReaderApp(App):
         if not self.file_path:
             self.action_library()
             return
-        if self.file_path.endswith(".pdf"):
-            paras = extract_text_from_pdf(self.file_path)
-            if not paras:
-                paras = ["[Error extracting text from PDF]"]
-        else:
-            paras = load_text(self.file_path)
-        wlines = []
-        for para in paras:
-            wlines.extend(wrap_text(para, width=max_width))
-            wlines.append("")
-        self.reader = Reader(wlines, scroll=0)
+        
         saved_state = load_state(self.file_path)
-        saved_state["total_lines"] = len(wlines)
-        saved_state["timestamp"] = datetime.now().isoformat()
-        save_state(self.file_path, saved_state)
         saved_scroll = saved_state.get("scroll", 0)
+        
         if saved_scroll > 0:
+            total_lines = saved_state.get("total_lines", 1)
             self.push_screen(
-                ResumePrompt(self.file_path, saved_scroll, len(wlines)),
+                ResumePrompt(self.file_path, saved_scroll, total_lines),
                 callback=self._handle_resume_choice
             )
         else:
-            self.update_view()
+            self._load_file_internal(0)
 
     def _handle_resume_choice(self, resume: bool | None):
         if resume:
             saved_state = load_state(self.file_path)
-            self.reader.scroll = saved_state.get("scroll", 0)
+            start_scroll = saved_state.get("scroll", 0)
         else:
-            self.reader.scroll = 0
-        self.update_view()
+            start_scroll = 0
+        self._load_file_internal(start_scroll)
     def update_view(self):
         if self.reader and self.view:
             height = self.size.height - 2
             visible_lines = self.reader.get_visible_lines(height)
             self.view.update("\n".join(visible_lines))
     def action_scroll_down(self):
-        if self.reader and isinstance(self.screen, ReaderApp):
+        if self.reader:
             self.reader.scroll_down()
             self.update_view()
 
     def action_scroll_up(self):
-        if self.reader and isinstance(self.screen, ReaderApp):
+        if self.reader:
             self.reader.scroll_up()
             self.update_view()
     def action_toc(self):
@@ -418,50 +422,36 @@ class ReaderApp(App):
         if result:
             self._load_file(result)
     
-    def _load_file(self, file_path):
-        self.file_path = file_path
-        
-        if self.file_path.endswith(".pdf"):
-            paras = extract_text_from_pdf(self.file_path)
-            if not paras:
-                paras = ["[Error extracting text from PDF]"]
-        else:
-            paras = load_text(self.file_path)
-        
-        wlines = []
-        for para in paras:
-            wlines.extend(wrap_text(para, width=max_width))
-            wlines.append("")
-        
-        self.reader = Reader(wlines, scroll=0)
-        
+    def _load_file_internal(self, start_scroll):
+        wlines = load_or_parse(self.file_path)
+        self.reader = Reader(wlines, scroll=start_scroll)
         saved_state = load_state(self.file_path)
         saved_state["total_lines"] = len(wlines)
         saved_state["timestamp"] = datetime.now().isoformat()
         save_state(self.file_path, saved_state)
         
+        self.update_view()
+    
+    def _load_file(self, file_path):
+        self.file_path = file_path
+        
+        saved_state = load_state(self.file_path)
         saved_scroll = saved_state.get("scroll", 0)
+        
         if saved_scroll > 0:
+            wlines = load_or_parse(self.file_path)
             self.push_screen(
                 ResumePrompt(self.file_path, saved_scroll, len(wlines)),
                 callback=self._handle_resume_choice
             )
         else:
-            self.update_view()
+            self._load_file_internal(0)
     
     def _add_file_to_library(self, path):
         state = load_state(path)
         if state and state.get("timestamp"):
             return
-        if path.endswith(".pdf"):
-            paras = extract_text_from_pdf(path)
-        else:
-            paras = load_text(path)
-        
-        wlines = []
-        for para in paras:
-            wlines.extend(wrap_text(para, width=max_width))
-            wlines.append("")
+        wlines = load_or_parse(path)
         
         state = {
             "scroll": 0,
@@ -490,14 +480,13 @@ class ReaderApp(App):
             self.apply_theme()
 
     def action_quit(self):
-        if not self.screen_stack or isinstance(self.screen, ReaderApp):
-            if self.reader and self.file_path:
-                state = load_state(self.file_path)
-                state["scroll"] = self.reader.scroll
-                state["total_lines"] = len(self.reader.lines)
-                state["timestamp"] = datetime.now().isoformat()
-                save_state(self.file_path, state)
-            self.exit()
+        if self.reader and self.file_path:
+            state = load_state(self.file_path)
+            state["scroll"] = self.reader.scroll
+            state["total_lines"] = len(self.reader.lines)
+            state["timestamp"] = datetime.now().isoformat()
+            save_state(self.file_path, state)
+        self.exit()
     
     def on_resume_decision(self, message: ResumeDecision):
         if resume is True:
