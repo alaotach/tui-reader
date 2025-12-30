@@ -1,12 +1,16 @@
 import textwrap
 import sys
-from textual.app import App
-from textual.containers import Vertical
+import textual
+from textual.app import App, ComposeResult
+from textual.containers import Container, Vertical
 from textual.widgets import Static
+from textual.widget import Widget
+from textual.reactive import reactive
+from textual.message import Message
+import textual.events
 from textual.events import Key
 from textual.screen import Screen
 from textual.events import Paste
-from textual.binding import Binding
 import json
 import os
 from datetime import datetime
@@ -85,7 +89,7 @@ def build_library():
             "progress": progress,
             "timestamp": data.get("timestamp", "")
         })
-    library.sort(key=lambda x: (x["progress"] == 100, -x["progress"], x.get("timestamp", "")), reverse=False)
+    library.sort(key=lambda x: x["timestamp"], reverse=True)
     with open(state_file, "w") as f:
         json.dump(state, f, indent=2)
     
@@ -205,6 +209,12 @@ max_width = 70
 class ReadingView(Static):
     pass
 
+class ResumeDecision(Message):
+    def __init__(self, resume: bool, scroll: int):
+        self.resume = resume
+        self.scroll = scroll['scroll'] if isinstance(scroll, dict) else scroll
+        super().__init__()
+
 class ReaderApp(App):
     CSS = """
     ReaderApp {
@@ -219,8 +229,8 @@ class ReaderApp(App):
         ("b", "bookmark", "Bookmark"),
         ("m", "show_bookmarks", "View Bookmarks"),
         ("p", "pages", "PDF Pages"),
+        # ("l", "library", "Open Library"),
         ("T", "toggle_theme", "Toggle Theme"),
-        ("l", "library", "Library"),
         ("ctrl+t", "theme_selector", "Select Theme"),
         ("ctrl+c", "quit", "Quit"),
     ]
@@ -284,12 +294,12 @@ class ReaderApp(App):
             visible_lines = self.reader.get_visible_lines(height)
             self.view.update("\n".join(visible_lines))
     def action_scroll_down(self):
-        if self.reader:
+        if self.reader and isinstance(self.screen, ReaderApp):
             self.reader.scroll_down()
             self.update_view()
 
     def action_scroll_up(self):
-        if self.reader:
+        if self.reader and isinstance(self.screen, ReaderApp):
             self.reader.scroll_up()
             self.update_view()
     def action_toc(self):
@@ -383,6 +393,8 @@ class ReaderApp(App):
         )
     def _handle_library_selection(self, result):
         if result is None:
+            if not self.file_path:
+                self.exit()
             return
         if isinstance(result, tuple) and result[0] in ("file", "folder"):
             mode, path = result
@@ -403,7 +415,39 @@ class ReaderApp(App):
             self.action_library()
             return
 
-        os.execv(sys.executable, [sys.executable, __file__, result])
+        if result:
+            self._load_file(result)
+    
+    def _load_file(self, file_path):
+        self.file_path = file_path
+        
+        if self.file_path.endswith(".pdf"):
+            paras = extract_text_from_pdf(self.file_path)
+            if not paras:
+                paras = ["[Error extracting text from PDF]"]
+        else:
+            paras = load_text(self.file_path)
+        
+        wlines = []
+        for para in paras:
+            wlines.extend(wrap_text(para, width=max_width))
+            wlines.append("")
+        
+        self.reader = Reader(wlines, scroll=0)
+        
+        saved_state = load_state(self.file_path)
+        saved_state["total_lines"] = len(wlines)
+        saved_state["timestamp"] = datetime.now().isoformat()
+        save_state(self.file_path, saved_state)
+        
+        saved_scroll = saved_state.get("scroll", 0)
+        if saved_scroll > 0:
+            self.push_screen(
+                ResumePrompt(self.file_path, saved_scroll, len(wlines)),
+                callback=self._handle_resume_choice
+            )
+        else:
+            self.update_view()
     
     def _add_file_to_library(self, path):
         state = load_state(path)
@@ -446,14 +490,28 @@ class ReaderApp(App):
             self.apply_theme()
 
     def action_quit(self):
-        if self.reader and self.file_path:
-            state = load_state(self.file_path)
-            state["scroll"] = self.reader.scroll
-            state["total_lines"] = len(self.reader.lines)
-            state["timestamp"] = datetime.now().isoformat()
-            save_state(self.file_path, state)
-        self.exit()
+        if not self.screen_stack or isinstance(self.screen, ReaderApp):
+            if self.reader and self.file_path:
+                state = load_state(self.file_path)
+                state["scroll"] = self.reader.scroll
+                state["total_lines"] = len(self.reader.lines)
+                state["timestamp"] = datetime.now().isoformat()
+                save_state(self.file_path, state)
+            self.exit()
     
+    def on_resume_decision(self, message: ResumeDecision):
+        if resume is True:
+            self.reader.scroll = load_state(self.file_path)
+            self.update_view()
+
+        elif resume is False:
+            self.reader.scroll = 0
+            self.update_view()
+
+        else:
+            saved_scroll = load_state(self.file_path)
+            save_state(self.file_path, saved_scroll)
+            self.exit()
     def _handle_toc_jump(self, line: int | None):
         if line is not None:
             self.reader.scroll = line
@@ -773,21 +831,6 @@ class BookmarkScreen(Screen):
             container.mount(new_static)
 
 class LibraryScreen(Screen):
-    BINDINGS = [
-        Binding("j", "lib_j", show=False, priority=True),
-        Binding("k", "lib_k", show=False, priority=True),
-        Binding("q", "lib_q", show=False, priority=True),
-        Binding("t", "lib_t", show=False, priority=True),
-        Binding("b", "lib_b", show=False, priority=True),
-        Binding("m", "lib_m", show=False, priority=True),
-        Binding("p", "lib_p", show=False, priority=True),
-        Binding("T", "lib_T", show=False, priority=True),
-        Binding("l", "lib_l", show=False, priority=True),
-        Binding("a", "lib_a", show=False, priority=True),
-        Binding("f", "lib_f", show=False, priority=True),
-        Binding("ctrl+t", "lib_ignore", show=False, priority=True),
-    ]
-    
     CSS = """
     LibraryScreen {
         background: black;
@@ -829,34 +872,21 @@ class LibraryScreen(Screen):
     
     def on_key(self, event: Key):
         if self.search_mode:
-            if event.key == "up":
-                self.index = max(0, self.index - 1)
-                self._update_selection()
-                return
-            elif event.key == "down":
-                self.index = min(len(self.filtered_library) - 1, self.index + 1)
-                self._update_selection()
-                return
             if event.key == "enter":
                 self._exit_search_mode()
                 return
-            elif event.key == "escape":
+            elif event.key in ("escape",):
                 self.search_buffer = ""
                 self.filtered_library = self.library
-                self.index = 0
                 self._exit_search_mode()
-                self._rebuild_list()
                 return
             elif event.key == "backspace":
                 self.search_buffer = self.search_buffer[:-1]
                 self._update_search()
-                return
             elif event.character and event.character.isprintable():
                 self.search_buffer += event.character
                 self._update_search()
-                return
             return
-        
         if self.input_mode:
             if event.key == "enter":
                 path = self.buffer.strip()
@@ -874,122 +904,44 @@ class LibraryScreen(Screen):
             elif event.character and event.character.isprintable():
                 self.buffer += event.character
                 self._update_input_prompt()
+
             return
         if event.key == "slash" or event.key == "/":
             self._enter_search_mode()
             return
             
-        elif event.key.lower() == "a":
+        if event.key.lower() == "a":
             self._enter_input_mode("file")
-            return
 
         elif event.key.lower() == "f":
             self._enter_input_mode("folder")
-            return
 
         elif event.key == "up":
             self.index = max(0, self.index - 1)
             self._update_selection()
-            return
 
         elif event.key == "down":
             self.index = min(len(self.filtered_library) - 1, self.index + 1)
             self._update_selection()
-            return
 
         elif event.key == "enter":
             if len(self.filtered_library) > 0:
                 self.dismiss(self.filtered_library[self.index]["path"])
-            return
 
         elif event.key == "delete":
             if len(self.filtered_library) > 0:
                 del_item = self.filtered_library[self.index]
                 self.library = [item for item in self.library if item["path"] != del_item["path"]]
                 self.dismiss(("delete", self.library))
-            return
-
-        elif event.key.lower() in ("q", "escape"):
+        elif event.key == "q" or event.key == "escape":
             self.dismiss(None)
-            return
-        event.prevent_default()
-        event.stop()
-
-    def _search_add(self, ch: str) -> None:
-        self.search_buffer += ch
-        self._update_search()
-
-    def action_lib_ignore(self) -> None:
-        return
-
-    def action_lib_j(self) -> None:
-        if self.search_mode:
-            self._search_add("j")
-            return
-        self.index = min(len(self.filtered_library) - 1, self.index + 1)
-        self._update_selection()
-
-    def action_lib_k(self) -> None:
-        if self.search_mode:
-            self._search_add("k")
-            return
-        self.index = max(0, self.index - 1)
-        self._update_selection()
-
-    def action_lib_q(self) -> None:
-        if self.search_mode:
-            self._search_add("q")
-            return
-        self.dismiss(None)
-
-    def action_lib_t(self) -> None:
-        if self.search_mode:
-            self._search_add("t")
-
-    def action_lib_b(self) -> None:
-        if self.search_mode:
-            self._search_add("b")
-
-    def action_lib_m(self) -> None:
-        if self.search_mode:
-            self._search_add("m")
-
-    def action_lib_p(self) -> None:
-        if self.search_mode:
-            self._search_add("p")
-
-    def action_lib_T(self) -> None:
-        if self.search_mode:
-            self._search_add("T")
-
-    def action_lib_l(self) -> None:
-        if self.search_mode:
-            self._search_add("l")
-
-    def action_lib_a(self) -> None:
-        if self.search_mode:
-            self._search_add("a")
-            return
-        self._enter_input_mode("file")
-
-    def action_lib_f(self) -> None:
-        if self.search_mode:
-            self._search_add("f")
-            return
-        self._enter_input_mode("folder")
     def _update_selection(self):
-        statics = list(self.query(Static))
-        rows = statics[1:]
-        for i, static in enumerate(rows):
+        statics = self.query(Static)
+        for i, static in enumerate(list(statics)[1:]):
             if i == self.index:
                 static.add_class("selected")
             else:
                 static.remove_class("selected")
-        if 0 <= self.index < len(rows):
-            try:
-                self.query_one("#box").scroll_to_widget(rows[self.index], top=True)
-            except Exception:
-                pass
     def _enter_input_mode(self, mode):
         self.input_mode = mode
         self.buffer = ""
