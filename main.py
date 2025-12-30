@@ -79,8 +79,12 @@ def scan_folder(folder_path):
 
 
 def build_library():
-    with open(state_file, "r") as f:
-        state = json.load(f)
+    try:
+        with open(state_file, "r", encoding="utf-8") as f:
+            state = json.load(f)
+    except (json.JSONDecodeError, FileNotFoundError):
+        return []
+    
     library = []
     for path, data in state.items():
         if path.startswith("_"):
@@ -106,8 +110,13 @@ def build_library():
     return library
 
 def load_theme():
-    with open(state_file, "r") as f:
-        state = json.load(f)
+    try:
+        with open(state_file, "r", encoding="utf-8") as f:
+            state = json.load(f)
+    except (json.JSONDecodeError, FileNotFoundError):
+        with open(state_file, 'w', encoding="utf-8") as f:
+            json.dump({}, f)
+        return THEMES["dark"]
 
     theme_state = state.get("_theme", {})
     theme_name = theme_state.get("theme", "dark")
@@ -116,21 +125,28 @@ def load_theme():
 
 
 def save_theme(theme_name):
-    with open(state_file, "r") as f:
-        state = json.load(f)
+    try:
+        with open(state_file, "r", encoding="utf-8") as f:
+            state = json.load(f)
+    except (json.JSONDecodeError, FileNotFoundError):
+        state = {}
 
     if "_theme" not in state:
         state["_theme"] = {}
 
     state["_theme"]["theme"] = theme_name
 
-    with open(state_file, "w") as f:
+    with open(state_file, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2)
 
 
 def save_state(file_path, data):
-    with open(state_file, 'r') as f:
-        state = json.load(f)
+    try:
+        with open(state_file, 'r', encoding='utf-8') as f:
+            state = json.load(f)
+    except (json.JSONDecodeError, FileNotFoundError):
+        state = {}
+    
     if isinstance(data, int):
         existing = state.get(file_path, {})
         existing["scroll"] = data
@@ -138,13 +154,17 @@ def save_state(file_path, data):
         state[file_path] = existing
     else:
         state[file_path] = data
-    with open(state_file, 'w') as f:
+    
+    with open(state_file, 'w', encoding='utf-8') as f:
         json.dump(state, f, indent=2)
 
 def load_state(file_path):
-    with open(state_file, 'r') as f:
-        state = json.load(f)
-    return state.get(file_path, {})
+    try:
+        with open(state_file, 'r', encoding='utf-8') as f:
+            state = json.load(f)
+        return state.get(file_path, {})
+    except (json.JSONDecodeError, FileNotFoundError):
+        return {}
 
 def parse_toc(lines):
     toc = []
@@ -706,16 +726,41 @@ class ReaderApp(App):
             return
         if isinstance(result, tuple) and result[0] in ("file", "folder"):
             mode, path = result
-            path = os.path.expanduser(path)
+            path = path.strip().strip('"').strip("'").strip("'").strip("'")
+            path = os.path.abspath(os.path.expanduser(path))
+            path = path.replace("'", "'").replace("'", "'")
+            
+            error_msg = None
+            success_count = 0
+            
             if mode == "file":
-                if os.path.isfile(path):
-                    self._add_file_to_library(path)
-                    self.action_library()
+                if not os.path.isfile(path):
+                    error_msg = f"File not found: {os.path.basename(path)}"
+                else:
+                    result = self._add_file_to_library(path)
+                    if result is True:
+                        success_count = 1
+                    elif isinstance(result, str):
+                        error_msg = result
+                    else:
+                        error_msg = "Failed to add file"
             elif mode == "folder":
-                if os.path.isdir(path):
-                    for file in scan_folder(path):
-                        self._add_file_to_library(file)
-                    self.action_library()
+                if not os.path.isdir(path):
+                    error_msg = f"Folder not found: {os.path.basename(path)}"
+                else:
+                    files = scan_folder(path)
+                    if not files:
+                        error_msg = "No readable files found in folder"
+                    else:
+                        for file in files:
+                            result = self._add_file_to_library(file)
+                            if result is True:
+                                success_count += 1
+            library = build_library()
+            self.push_screen(
+                LibraryScreen(library, status_msg=error_msg, success_count=success_count),
+                callback=self._handle_library_selection
+            )
             return
         if isinstance(result, tuple) and result[0] == "delete":
             new_library = result[1]
@@ -755,20 +800,29 @@ class ReaderApp(App):
             self._load_file_internal(0)
     
     def _add_file_to_library(self, path):
-        state = load_state(path)
-        if state and state.get("timestamp"):
-            return
-        
-        paras = load_or_parse(path)
-        temp_reader = Reader(paras=paras, width=max_width)
-        
-        state = {
-            "scroll": 0,
-            "timestamp": datetime.now().isoformat(),
-            "bookmarks": [],
-            "total_lines": temp_reader.total_lines
-        }
-        save_state(path, state)
+        try:
+            path = path.strip().strip('"').strip("'").strip("'").strip("'")
+            path = os.path.abspath(os.path.expanduser(path))
+            path = path.replace("'", "'").replace("'", "'")
+            if not os.path.isfile(path):
+                return f"Not a file: {os.path.basename(path)}"
+            if not any(path.lower().endswith(ext) for ext in exts):
+                return f"Unsupported file type: {os.path.basename(path)}"
+            state = load_state(path)
+            if state and state.get("timestamp"):
+                return True
+            paras = load_or_parse(path)
+            temp_reader = Reader(paras=paras, width=max_width)
+            state = {
+                "scroll": 0,
+                "timestamp": datetime.now().isoformat(),
+                "bookmarks": [],
+                "total_lines": temp_reader.total_lines
+            }
+            save_state(path, state)
+            return True
+        except Exception as e:
+            return f"Error: {str(e)[:50]}"
     def _rewrite_library(self, library):
         with open(state_file, "r") as f:
             state = json.load(f)
@@ -1313,7 +1367,7 @@ class LibraryScreen(Screen):
         background: #444444;
     }
     """
-    def __init__(self, library):
+    def __init__(self, library, status_msg=None, success_count=0):
         super().__init__()
         self.library = library
         self.index = 0
@@ -1322,9 +1376,16 @@ class LibraryScreen(Screen):
         self.search_mode = False
         self.search_buffer = ""
         self.filtered_library = library
+        self.status_msg = status_msg
+        self.success_count = success_count
     def compose(self):
         with Vertical(id="box"):
-            yield Static("Library  (A=add file, F=add folder, /=search)\n", id="title")
+            title_text = "Library  (A=add file, F=add folder, /=search)\n"
+            if self.status_msg:
+                title_text = f"❌ {self.status_msg}\n"
+            elif self.success_count > 0:
+                title_text = f"✓ Added {self.success_count} file(s)\n"
+            yield Static(title_text, id="title")
             for i, item in enumerate(self.filtered_library):
                 progress = f" - {item['progress']}%" if item['progress'] < 100 else ""
                 yield Static(
