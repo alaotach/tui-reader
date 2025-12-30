@@ -15,6 +15,13 @@ import json
 import os
 from datetime import datetime
 from pdfminer.high_level import extract_text
+from pdfminer.pdfpage import PDFPage
+from pdfminer.pdfinterp import PDFResourceManager, PDFPageInterpreter
+from pdfminer.converter import TextConverter
+from pdfminer.layout import LAParams
+from io import StringIO
+from pdfminer.pdfpage import PDFPage
+
 
 exts = ['.txt', '.md', '.pdf']
 
@@ -74,7 +81,10 @@ def build_library():
         scroll = data.get("scroll", 0)
         total = data.get("total_lines", 1)
         
-        progress = min(100, int((scroll / max(total - 1, 1)) * 100))
+        if total is None or total <= 1:
+            progress = 0
+        else:
+            progress = min(100, int((scroll / max(total - 1, 1)) * 100))
         library.append({
             "path": path,
             "scroll": scroll,
@@ -147,51 +157,106 @@ def wrap_text(text, width=70):
     return textwrap.wrap(text, width=width, replace_whitespace=False, drop_whitespace=False)
 
 def load_or_parse(file_path):
-    cpath = cache_path(file_path)
-    mtime = os.path.getmtime(file_path)
-
-    if os.path.exists(cpath):
-        with open(cpath, "r", encoding="utf-8") as f:
-            cached = json.load(f)
-        if cached.get("mtime") == mtime:
-            return cached["lines"]
     if file_path.endswith(".pdf"):
-        paras = extract_text_from_pdf(file_path)
+        return LazyPdfLoader(file_path)
     else:
+        cpath = cache_path(file_path)
+        mtime = os.path.getmtime(file_path)
+        if os.path.exists(cpath):
+            with open(cpath, "r", encoding="utf-8") as f:
+                cached = json.load(f)
+            if cached.get("mtime") == mtime and "paras" in cached:
+                return cached["paras"]
         paras = load_text(file_path)
+        with open(cpath, "w", encoding="utf-8") as f:
+            json.dump({"mtime": mtime, "paras": paras}, f)
+        return paras
 
-    lines = []
-    for p in paras:
-        lines.extend(wrap_text(p, width=max_width))
-        lines.append("")
-
-    with open(cpath, "w", encoding="utf-8") as f:
-        json.dump({"mtime": mtime, "lines": lines}, f)
-
-    return lines
-
-def extract_text_from_pdf(file_path):
-    text = extract_text(file_path)
-    if not text:
-        return []
-    pages = text.split("\x0c")
-    paras = []
-    for i, t in enumerate(pages, start=1):
-        if t.strip():
-            paras.append(f"--- Page {i} ---")
-            lines = t.splitlines()
-            buffer = []
-            for line in lines:
-                stripped = line.strip()
-                if stripped:
-                    buffer.append(stripped)
-                else:
-                    if buffer:
-                        paras.append(" ".join(buffer))
+class LazyPdfLoader:
+    def __init__(self, file_path):
+        self.file_path = file_path
+        self.cpath = cache_path(file_path)
+        self.mtime = os.path.getmtime(file_path)
+        self.cache_data = self._load_cache()
+        self.total_pages = self._count_pages()
+        self.page_para_map = {}
+        self.current_max_para = 0
+    def _load_cache(self):
+        if os.path.exists(self.cpath):
+            with open(self.cpath, "r", encoding="utf-8") as f:
+                cached = json.load(f)
+            if cached.get("mtime") == self.mtime and "pages" in cached:
+                return cached
+        return {"mtime": self.mtime, "pages": {}, "total_pages": None}
+    def _count_pages(self):
+        if self.cache_data.get("total_pages"):
+            return self.cache_data["total_pages"]
+        with open(self.file_path, 'rb') as fp:
+            total = len(list(PDFPage.get_pages(fp)))
+        self.cache_data["total_pages"] = total
+        self._save_cache()
+        return total
+    
+    def _save_cache(self):
+        with open(self.cpath, "w", encoding="utf-8") as f:
+            json.dump(self.cache_data, f)
+    
+    def _extract_page(self, page_num):
+        with open(self.file_path, 'rb') as fp:
+            rmgr = PDFResourceManager()
+            pages_iter = PDFPage.get_pages(fp)
+            
+            for i, page in enumerate(pages_iter, start=1):
+                if i == page_num:
+                    output = StringIO()
+                    device = TextConverter(rmgr, output, laparams=LAParams())
+                    ctx = PDFPageInterpreter(rmgr, device)
+                    ctx.process_page(page)
+                    text = output.getvalue()
+                    device.close()
+                    output.close()
+                    paras = []
+                    if text.strip():
+                        paras.append(f"--- Page {page_num} ---")
+                        lines = text.splitlines()
                         buffer = []
-            if buffer:
-                paras.append(" ".join(buffer))
-    return paras
+                        for line in lines:
+                            stripped = line.strip()
+                            if stripped:
+                                buffer.append(stripped)
+                            else:
+                                if buffer:
+                                    paras.append(" ".join(buffer))
+                                    buffer = []
+                        if buffer:
+                            paras.append(" ".join(buffer))
+                    return paras
+        return []
+    
+    def get_page(self, page_num):
+        page_key = str(page_num)
+        if page_key not in self.cache_data["pages"]:
+            paras = self._extract_page(page_num)
+            self.cache_data["pages"][page_key] = paras
+            self._save_cache()
+        return self.cache_data["pages"][page_key]
+    
+    def get_para(self, index):
+        for page_num in range(1, self.total_pages + 1):
+            if page_num not in self.page_para_map:
+                paras = self.get_page(page_num)
+                start = self.current_max_para
+                end = start+len(paras)
+                self.page_para_map[page_num] = (start, end)
+                self.current_max_para = end
+            start, end = self.page_para_map[page_num]
+            if start <= index < end:
+                paras = self.get_page(page_num)
+                local_idx = index - start
+                if local_idx < len(paras):
+                    return paras[local_idx]
+                return ""
+        return ""
 
 def extract_pdf_pages(lines):
     pages = []
@@ -203,21 +268,106 @@ def extract_pdf_pages(lines):
                     "page": page_num,
                     "scroll": i
                 })
-            except ValueError:
+            except:
                 pass
     return pages
 
 
 class Reader:
-    def __init__(self, lines, scroll=0):
-        self.lines = lines
-        self.scroll = scroll
-    def scroll_down(self, n=1):
-        self.scroll = min(self.scroll + n, len(self.lines) - 1)
-    def scroll_up(self, n=1):
-        self.scroll = max(self.scroll - n, 0)
+    def __init__(self, paras, width):
+        self.paras = paras
+        self.width = width
+        self.scroll = 0
+        self.line_cache = {}
+        self.is_lazy_pdf = isinstance(paras, LazyPdfLoader)
+        self.para_offsets = self._build_offsets()
+    
+    def _build_offsets(self):
+        offsets = []
+        current = 0
+        para_count = len(self.paras) if not self.is_lazy_pdf else self.paras.total_pages * 10
+        
+        if self.is_lazy_pdf:
+            self.total_lines = None
+            return offsets
+        
+        for i in range(para_count):
+            if self.is_lazy_pdf:
+                p = self.paras[i]
+            else:
+                if i >= len(self.paras):
+                    break
+                p = self.paras[i]
+            wrapped = max(1, len(textwrap.wrap(p, self.width)))
+            offsets.append(current)
+            current += wrapped + 1
+        self.total_lines = current
+        return offsets
+    
+    def _get_para(self, index):
+        if self.is_lazy_pdf:
+            if not hasattr(self, '_pcache'):
+                self._pcache = {}
+                self._poffs = {}
+                self._cline = 0
+                self._cpara = 0
+            while self._cline <= index:
+                if self._cpara not in self._pcache:
+                    try:
+                        para = self.paras.get_para(self._cpara)
+                        if not para:
+                            if self.total_lines is None:
+                                self.total_lines = self._cline
+                            break
+                        self._pcache[self._cpara] = para
+                        self._poffs[self._cpara] = self._cline
+                        wrapped_count = max(1, len(textwrap.wrap(para, self.width)))
+                        self._cline += wrapped_count + 1
+                        self._cpara += 1
+                    except:
+                        if self.total_lines is None:
+                            self.total_lines = self._cline
+                        break
+                else:
+                    para = self._pcache[self._cpara]
+                    wrapped_count = max(1, len(textwrap.wrap(para, self.width)))
+                    self._cline += wrapped_count + 1
+                    self._cpara += 1
+            para_i = max((i for i, off in self._poffs.items() if off <= index), default=0)
+            return para_i, self._pcache.get(para_i, ""), self._poffs.get(para_i, 0)
+        else:
+            para_i = max((i for i, off in enumerate(self.para_offsets) if off <= index), default=0)
+            return para_i, self.paras[para_i], self.para_offsets[para_i]
+    
+    def _line_from_index(self, index):
+        if index in self.line_cache:
+            return self.line_cache[index]
+        
+        para_i, para_text, start = self._get_para(index)
+        local = index - start
+        wrapped = textwrap.wrap(para_text, self.width) if para_text else []
+        
+        if local < len(wrapped):
+            line = wrapped[local]
+        else:
+            line = ""
+        
+        self.line_cache[index] = line
+        return line
+    
     def get_visible_lines(self, height):
-        return self.lines[self.scroll:self.scroll + height]
+        lines = []
+        if self.total_lines is not None:
+            end = min(self.scroll + height, self.total_lines)
+        else:
+            end = self.scroll + height
+        
+        for i in range(self.scroll, end):
+            try:
+                lines.append(self._line_from_index(i))
+            except:
+                break
+        return lines
 
 max_width = 70
 
@@ -299,18 +449,26 @@ class ReaderApp(App):
             self.view.update("\n".join(visible_lines))
     def action_scroll_down(self):
         if self.reader:
-            self.reader.scroll_down()
+            if self.reader.total_lines is not None:
+                self.reader.scroll = min(
+                    self.reader.scroll + 1,
+                    self.reader.total_lines - 1
+                )
+            else:
+                self.reader.scroll += 1
             self.update_view()
 
     def action_scroll_up(self):
         if self.reader:
-            self.reader.scroll_up()
+            self.reader.scroll = max(self.reader.scroll - 1, 0)
             self.update_view()
     def action_toc(self):
         if not self.file_path or not self.file_path.endswith(".md"):
             return
-
-        toc = parse_toc(self.reader.lines)
+        if self.reader.total_lines is None:
+            return
+        all_lines = [self.reader._line_from_index(i) for i in range(self.reader.total_lines)]
+        toc = parse_toc(all_lines)
         if not toc:
             return
 
@@ -328,13 +486,13 @@ class ReaderApp(App):
         if self.file_path.endswith(".pdf"):
             page_num = 1
             for i in range(self.reader.scroll, -1, -1):
-                line = self.reader.lines[i]
+                line = self.reader._line_from_index(i)
                 if line.startswith("--- Page ") and line.endswith(" ---"):
                     page_num = int(line.split("Page ")[1].split(" ---")[0])
                     break
             preview = f"Page {page_num}"
         else:
-            preview = self.reader.lines[self.reader.scroll][:50]
+            preview = self.reader._line_from_index(self.reader.scroll)[:50]
 
         for bm in bookmarks:
             if abs(bm["scroll"] - self.reader.scroll) <= bm_tolerance:
@@ -368,7 +526,8 @@ class ReaderApp(App):
     def action_pages(self):
         if not self.file_path or not self.file_path.endswith(".pdf"):
             return
-        pages = extract_pdf_pages(self.reader.lines)
+        all_lines = [self.reader._line_from_index(i) for i in range(self.reader.total_lines)]
+        pages = extract_pdf_pages(all_lines)
         if not pages:
             return
         self.push_screen(
@@ -423,12 +582,15 @@ class ReaderApp(App):
             self._load_file(result)
     
     def _load_file_internal(self, start_scroll):
-        wlines = load_or_parse(self.file_path)
-        self.reader = Reader(wlines, scroll=start_scroll)
-        saved_state = load_state(self.file_path)
-        saved_state["total_lines"] = len(wlines)
-        saved_state["timestamp"] = datetime.now().isoformat()
-        save_state(self.file_path, saved_state)
+        paras = load_or_parse(self.file_path)
+        
+        self.reader = Reader(paras=paras, width=max_width)
+        self.reader.scroll = start_scroll
+        
+        state = load_state(self.file_path)
+        state["total_lines"] = self.reader.total_lines
+        state["timestamp"] = datetime.now().isoformat()
+        save_state(self.file_path, state)
         
         self.update_view()
     
@@ -437,11 +599,11 @@ class ReaderApp(App):
         
         saved_state = load_state(self.file_path)
         saved_scroll = saved_state.get("scroll", 0)
+        total_lines = saved_state.get("total_lines", 1)
         
         if saved_scroll > 0:
-            wlines = load_or_parse(self.file_path)
             self.push_screen(
-                ResumePrompt(self.file_path, saved_scroll, len(wlines)),
+                ResumePrompt(self.file_path, saved_scroll, total_lines),
                 callback=self._handle_resume_choice
             )
         else:
@@ -451,13 +613,15 @@ class ReaderApp(App):
         state = load_state(path)
         if state and state.get("timestamp"):
             return
-        wlines = load_or_parse(path)
+        
+        paras = load_or_parse(path)
+        temp_reader = Reader(paras=paras, width=max_width)
         
         state = {
             "scroll": 0,
             "timestamp": datetime.now().isoformat(),
             "bookmarks": [],
-            "total_lines": len(wlines)
+            "total_lines": temp_reader.total_lines
         }
         save_state(path, state)
     def _rewrite_library(self, library):
@@ -483,7 +647,7 @@ class ReaderApp(App):
         if self.reader and self.file_path:
             state = load_state(self.file_path)
             state["scroll"] = self.reader.scroll
-            state["total_lines"] = len(self.reader.lines)
+            state["total_lines"] = self.reader.total_lines
             state["timestamp"] = datetime.now().isoformat()
             save_state(self.file_path, state)
         self.exit()
@@ -668,7 +832,11 @@ class ResumePrompt(Screen):
         self.scroll = scroll['scroll'] if isinstance(scroll, dict) else scroll
         self.total_lines = total_lines
         self.file_name = os.path.basename(file_path)
-        self.progress = int((scroll['scroll'] if isinstance(scroll, dict) else scroll / max(total_lines - 1, 1)) * 100)
+        
+        if total_lines is None or total_lines <= 1:
+            self.progress = 0
+        else:
+            self.progress = int((self.scroll / max(total_lines - 1, 1)) * 100)
 
     def compose(self):
         yield Vertical(
