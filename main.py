@@ -21,6 +21,8 @@ from pdfminer.converter import TextConverter
 from pdfminer.layout import LAParams
 from io import StringIO
 from pdfminer.pdfpage import PDFPage
+import time
+import asyncio
 
 
 exts = ['.txt', '.md', '.pdf']
@@ -404,6 +406,8 @@ class ReaderApp(App):
         self.file_path = file_path
         self.reader: Reader = None
         self.view: ReadingView = None
+        self._scroll_speed = 1
+        self._last_scroll_time = 0
     def compose(self):
         yield ReadingView(id="reader-view")
     def apply_theme(self):
@@ -448,20 +452,53 @@ class ReaderApp(App):
             visible_lines = self.reader.get_visible_lines(height)
             self.view.update("\n".join(visible_lines))
     def action_scroll_down(self):
-        if self.reader:
-            if self.reader.total_lines is not None:
-                self.reader.scroll = min(
-                    self.reader.scroll + 1,
-                    self.reader.total_lines - 1
-                )
-            else:
-                self.reader.scroll += 1
-            self.update_view()
+        if not self.reader:
+            return
+        t = time.time()
+        if t - self._last_scroll_time < 0.3:
+            self._scroll_speed = min(self._scroll_speed + 1, 10)
+        else:
+            self._scroll_speed = 1
+        self._last_scroll_time = t
+        
+        if self.reader.total_lines is not None:
+            self.reader.scroll = min(
+                self.reader.scroll + self._scroll_speed,
+                self.reader.total_lines - 1
+            )
+        else:
+            self.reader.scroll += self._scroll_speed
+        self.update_view()
+        self._save_scroll_position()
 
     def action_scroll_up(self):
-        if self.reader:
-            self.reader.scroll = max(self.reader.scroll - 1, 0)
-            self.update_view()
+        if not self.reader:
+            return
+        t = time.time()
+        if t - self._last_scroll_time < 0.3:
+            self._scroll_speed = min(self._scroll_speed + 1, 10)
+        else:
+            self._scroll_speed = 1
+        self._last_scroll_time = t
+        
+        self.reader.scroll = max(self.reader.scroll - self._scroll_speed, 0)
+        self.update_view()
+        self._save_scroll_position()
+
+    def _save_scroll_position(self):
+        if not self.file_path or not self.reader:
+            return
+        if not hasattr(self, '_scroll_count'):
+            self._scroll_count = 0
+        self._scroll_count += 1
+        if self._scroll_count >= 10:
+            self._scroll_count = 0
+            state = load_state(self.file_path)
+            state["scroll"] = self.reader.scroll
+            state["total_lines"] = self.reader.total_lines
+            state["timestamp"] = datetime.now().isoformat()
+            save_state(self.file_path, state)
+
     def action_toc(self):
         if not self.file_path or not self.file_path.endswith(".md"):
             return
@@ -549,6 +586,13 @@ class ReaderApp(App):
             callback=self._handle_theme_selection
         )
     def action_library(self):
+        if self.reader and self.file_path:
+            state = load_state(self.file_path)
+            state["scroll"] = self.reader.scroll
+            state["total_lines"] = self.reader.total_lines
+            state["timestamp"] = datetime.now().isoformat()
+            save_state(self.file_path, state)
+        
         library = build_library()
         self.push_screen(
             LibraryScreen(library),
