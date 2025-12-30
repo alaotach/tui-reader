@@ -599,14 +599,35 @@ class ReaderApp(App):
     def action_pages(self):
         if not self.file_path or not self.file_path.endswith(".pdf"):
             return
-        all_lines = [self.reader._line_from_index(i) for i in range(self.reader.total_lines)]
-        pages = extract_pdf_pages(all_lines)
-        if not pages:
+        
+        # For PDFs, extract page markers from visible content
+        if isinstance(self.reader.paras, LazyPdfLoader):
+            pages = []
+            page_num = 1
+            scroll_pos = 0
+            # Scan through loaded pages to find page markers
+            for para_idx in range(self.reader.paras.total_pages * 10):
+                try:
+                    line = self.reader._line_from_index(scroll_pos)
+                    if line.startswith("--- Page ") and line.endswith(" ---"):
+                        try:
+                            page_num = int(line.split("Page ")[1].split(" ---")[0])
+                            pages.append({"page": page_num, "scroll": scroll_pos})
+                        except:
+                            pass
+                    scroll_pos += 1
+                except:
+                    break
+            
+            if not pages:
+                return
+            self.push_screen(
+                PdfPageScreen(pages),
+                callback=self._handle_toc_jump
+            )
+        else:
+            # Non-PDF shouldn't reach here but handle gracefully
             return
-        self.push_screen(
-            PdfPageScreen(pages),
-            callback=self._handle_toc_jump
-        )
     
     def action_toggle_theme(self):
         current_name = self._current_theme["name"]
@@ -729,10 +750,8 @@ class ReaderApp(App):
             path = path.strip().strip('"').strip("'").strip("'").strip("'")
             path = os.path.abspath(os.path.expanduser(path))
             path = path.replace("'", "'").replace("'", "'")
-            
             error_msg = None
             success_count = 0
-            
             if mode == "file":
                 if not os.path.isfile(path):
                     error_msg = f"File not found: {os.path.basename(path)}"
