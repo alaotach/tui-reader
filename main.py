@@ -23,7 +23,14 @@ from io import StringIO
 from pdfminer.pdfpage import PDFPage
 import time
 import asyncio
-
+import subprocess
+try:
+    from vosk import Model, KaldiRecognizer
+    import pyaudio
+    import queue
+    VOICE_AVAILABLE = True
+except ImportError:
+    VOICE_AVAILABLE = False
 
 exts = ['.txt', '.md', '.pdf']
 
@@ -396,6 +403,7 @@ class ReaderApp(App):
         ("b", "bookmark", "Bookmark"),
         ("m", "show_bookmarks", "View Bookmarks"),
         ("p", "pages", "PDF Pages"),
+        ("v", "toggle_voice", "Voice Control"),
         # ("l", "library", "Open Library"),
         ("T", "toggle_theme", "Toggle Theme"),
         ("ctrl+t", "theme_selector", "Select Theme"),
@@ -408,6 +416,10 @@ class ReaderApp(App):
         self.view: ReadingView = None
         self._scroll_speed = 1
         self._last_scroll_time = 0
+        self._voice_active = False
+        self._voice_worker = None
+        self._auto_scroll_active = False
+        self._auto_scroll_speed = 1
     def compose(self):
         yield ReadingView(id="reader-view")
     def apply_theme(self):
@@ -450,7 +462,11 @@ class ReaderApp(App):
         if self.reader and self.view:
             height = self.size.height - 2
             visible_lines = self.reader.get_visible_lines(height)
-            self.view.update("\n".join(visible_lines))
+            content = "\n".join(visible_lines)
+            if self._voice_active:
+                indicator = "[🎙 VOICE]" if self._auto_scroll_active else "[🎙 voice]"
+                content = f"{indicator}\n{content}"
+            self.view.update(content)
     def action_scroll_down(self):
         if not self.reader:
             return
@@ -585,6 +601,91 @@ class ReaderApp(App):
             ThemeSelector(),
             callback=self._handle_theme_selection
         )
+    
+    def action_toggle_voice(self):
+        if not VOICE_AVAILABLE:
+            self.push_screen(
+                VoiceInstallScreen(),
+                callback=self._handle_voice_install
+            )
+            return
+        if not self.reader:
+            return
+        if self._voice_active:
+            self._voice_active = False
+            self._auto_scroll_active = False
+            self.update_view()
+        else:
+            model_path = os.path.join(state_dir, "vosk-model")
+            if not os.path.exists(model_path):
+                self.push_screen(VoiceSetupScreen(model_missing=True))
+                return
+            self._voice_active = True
+            self._voice_worker = self.run_worker(self._voice_listener(), exclusive=False)
+            self.update_view()
+    
+    def _handle_voice_install(self, result):
+        if result:
+            pass
+    
+    async def _voice_listener(self):
+        try:
+            model_path = os.path.join(state_dir, "vosk-model")
+            if not os.path.exists(model_path):
+                return            
+            model = Model(model_path)
+            rec = KaldiRecognizer(model, 16000)
+            rec.SetWords(True)
+            p = pyaudio.PyAudio()
+            stream = p.open(format=pyaudio.paInt16,
+                          channels=1,
+                          rate=16000,
+                          input=True,
+                          frames_per_buffer=4000)
+            stream.start_stream()
+            while self._voice_active:
+                data = stream.read(4000, exception_on_overflow=False)
+                if rec.AcceptWaveform(data):
+                    result = json.loads(rec.Result())
+                    text = result.get("text", "").lower()
+                    if text:
+                        self._process_voice_command(text)
+                await asyncio.sleep(0.01)
+            stream.stop_stream()
+            stream.close()
+            p.terminate()
+        except:
+            self._voice_active = False
+            self.update_view()
+    
+    def _process_voice_command(self, text: str):
+        if "scroll" in text and "stop" not in text:
+            if not self._auto_scroll_active:
+                self._auto_scroll_active = True
+                self.run_worker(self._auto_scroll(), exclusive=False)
+        elif "stop" in text:
+            self._auto_scroll_active = False
+        elif "faster" in text:
+            self._auto_scroll_speed = min(self._auto_scroll_speed + 1, 15)
+        elif "slower" in text or "slow" in text:
+            self._auto_scroll_speed = max(self._auto_scroll_speed - 1, 1)
+        elif "up" in text:
+            self.action_scroll_up()
+        elif "down" in text:
+            self.action_scroll_down()
+        self.update_view()
+    
+    async def _auto_scroll(self):
+        while self._auto_scroll_active and self.reader:
+            if self.reader.total_lines is not None:
+                self.reader.scroll = min(
+                    self.reader.scroll + self._auto_scroll_speed,
+                    self.reader.total_lines - 1
+                )
+            else:
+                self.reader.scroll += self._auto_scroll_speed
+            self.update_view()
+            await asyncio.sleep(0.1)
     def action_library(self):
         if self.reader and self.file_path:
             state = load_state(self.file_path)
@@ -688,6 +789,8 @@ class ReaderApp(App):
             self.apply_theme()
 
     def action_quit(self):
+        self._voice_active = False
+        self._auto_scroll_active = False
         if self.reader and self.file_path:
             state = load_state(self.file_path)
             state["scroll"] = self.reader.scroll
@@ -766,6 +869,168 @@ class ThemeSelector(Screen):
                 static.add_class("selected")
             else:
                 static.remove_class("selected")
+
+class VoiceSetupScreen(Screen):
+    CSS = """
+    VoiceSetupScreen {
+        background: black;
+        align: center middle;
+    }
+    #box {
+        width: 70;
+        padding: 1 2;
+        border: round white;
+    }
+    """
+    def __init__(self, model_missing=False):
+        super().__init__()
+        self.model_missing = model_missing
+    
+    def compose(self):
+        if self.model_missing:
+            msg = [
+                "Voice Control - Model Missing\n",
+                "Vosk model not found.\n",
+                "Download: https://alphacephei.com/vosk/models",
+                "Extract to: ~/.reader_app/vosk-model/\n",
+                "Press any key to close"
+            ]
+        else:
+            msg = [
+                "Voice Control - Dependencies Missing\n",
+                "Install required packages:",
+                "  pip install vosk pyaudio\n",
+                "Then download Vosk model:",
+                "  https://alphacephei.com/vosk/models",
+                "Extract to: ~/.reader_app/vosk-model/\n",
+                "Press any key to close"
+            ]
+        
+        yield Vertical(
+            *[Static(line) for line in msg],
+            id="box"
+        )
+    
+    def on_key(self, event: Key):
+        self.dismiss()
+
+class VoiceInstallScreen(Screen):
+    CSS = """
+    VoiceInstallScreen {
+        background: black;
+        align: center middle;
+    }
+    #box {
+        width: 70;
+        padding: 1 2;
+        border: round white;
+    }
+    """
+    def compose(self):
+        yield Vertical(
+            Static("Voice Control Setup\n"),
+            Static("Installing dependencies...\n", id="status"),
+            Static("This may take a minute."),
+            id="box"
+        )
+    
+    def on_mount(self):
+        self.run_worker(self._install_dependencies(), exclusive=True)
+    
+    async def _install_dependencies(self):
+        try:
+            await asyncio.sleep(0.1)
+            status_widget = self.query_one("#status", Static)
+            status_widget.update("Installing vosk...")
+            result1 = subprocess.run(
+                [sys.executable, "-m", "pip", "install", "vosk"],
+                capture_output=True,
+                text=True
+            )
+            
+            status_widget.update("Installing pyaudio...")
+            result2 = subprocess.run(
+                [sys.executable, "-m", "pip", "install", "pyaudio"],
+                capture_output=True,
+                text=True
+            )
+            if result1.returncode == 0 and result2.returncode == 0:
+                status_widget.update(
+                    "✓ Dependencies installed!\n\n"
+                    "Download Vosk model:\n"
+                    "https://alphacephei.com/vosk/models\n"
+                    "Extract to: ~/.reader_app/vosk-model/\n\n"
+                    "Restart the app to use voice control.\n\n"
+                    "Press any key to close and restart"
+                )
+            else:
+                error_msg = result1.stderr if result1.returncode != 0 else result2.stderr
+                status_widget.update(
+                    f"✗ Installation failed\n\n"
+                    f"Error: {error_msg[:100]}\n\n"
+                    f"Try manually: pip install vosk pyaudio\n\n"
+                    f"Press any key to close"
+                )
+        except Exception as e:
+            try:
+                status_widget = self.query_one("#status", Static)
+                status_widget.update(
+                    f"✗ Installation failed\n\n"
+                    f"Error: {str(e)}\n\n"
+                    f"Try manually: pip install vosk pyaudio\n\n"
+                    f"Press any key to close"
+                )
+            except:
+                pass
+        
+        await asyncio.sleep(1)
+    
+    def on_key(self, event: Key):
+        self.dismiss(False)
+
+class VoiceSetupScreen(Screen):
+    CSS = """
+    VoiceSetupScreen {
+        background: black;
+        align: center middle;
+    }
+    #box {
+        width: 70;
+        padding: 1 2;
+        border: round white;
+    }
+    """
+    def __init__(self, model_missing=False):
+        super().__init__()
+        self.model_missing = model_missing
+    
+    def compose(self):
+        if self.model_missing:
+            msg = [
+                "Voice Control - Model Missing\n",
+                "Vosk model not found.\n",
+                "Download: https://alphacephei.com/vosk/models",
+                "Extract to: ~/.reader_app/vosk-model/\n",
+                "Press any key to close"
+            ]
+        else:
+            msg = [
+                "Voice Control - Dependencies Missing\n",
+                "Install required packages:",
+                "  pip install vosk pyaudio\n",
+                "Then download Vosk model:",
+                "  https://alphacephei.com/vosk/models",
+                "Extract to: ~/.reader_app/vosk-model/\n",
+                "Press any key to close"
+            ]
+        
+        yield Vertical(
+            *[Static(line) for line in msg],
+            id="box"
+        )
+    
+    def on_key(self, event: Key):
+        self.dismiss()
 
 class PdfPageScreen(Screen):
     CSS = """
