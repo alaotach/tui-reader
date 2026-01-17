@@ -1,0 +1,4 @@
+textual
+pdfminer.six
+vosk //optional
+pyaudio //optional
